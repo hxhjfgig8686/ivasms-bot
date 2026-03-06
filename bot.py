@@ -1,166 +1,145 @@
-import os
+import requests
 import re
 import time
-from html import unescape
-from http.cookiejar import CookieJar
-from urllib.parse import urlencode
-from urllib.request import HTTPCookieProcessor, Request, build_opener
+import os
 
-BASE_URL = os.getenv("IVASMS_BASE_URL", "https://www.ivasms.com").rstrip("/")
-POLL_INTERVAL_SECONDS = int(os.getenv("IVASMS_POLL_INTERVAL", "5"))
-RETRY_DELAY_SECONDS = int(os.getenv("IVASMS_RETRY_DELAY", "3"))
+BASE_URL = "https://www.ivasms.com"
 
-EMAIL = os.getenv("IVASMS_EMAIL", "")
-PASSWORD = os.getenv("IVASMS_PASSWORD", "")
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+EMAIL = os.getenv("IVASMS_EMAIL")
+PASSWORD = os.getenv("IVASMS_PASSWORD")
+
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
-class SimpleResponse:
-    def __init__(self, text, url):
-        self.text = text
-        self.url = url
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+}
 
 
-class SimpleSession:
-    def __init__(self):
-        cookie_jar = CookieJar()
-        self.opener = build_opener(HTTPCookieProcessor(cookie_jar))
+def send_telegram(text):
 
-    def get(self, url, timeout=20):
-        request = Request(url, method="GET")
-        with self.opener.open(request, timeout=timeout) as response:
-            html = response.read().decode("utf-8", errors="ignore")
-            return SimpleResponse(html, response.geturl())
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-    def post(self, url, data=None, timeout=20):
-        encoded = urlencode(data or {}).encode("utf-8")
-        request = Request(url, data=encoded, method="POST")
-        with self.opener.open(request, timeout=timeout) as response:
-            html = response.read().decode("utf-8", errors="ignore")
-            return SimpleResponse(html, response.geturl())
+    data = {
+        "chat_id": CHAT_ID,
+        "text": text
+    }
 
-
-def send_telegram(text, bot_token=BOT_TOKEN, chat_id=CHAT_ID):
-    if not bot_token or not chat_id:
-        raise ValueError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
-
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    SimpleSession().post(url, data={"chat_id": chat_id, "text": text}, timeout=20)
-
-
-def extract_code(text):
-    match = re.search(r"\b\d{4,8}\b", text)
-    return match.group() if match else None
-
-
-def _clean_html_text(html_fragment):
-    text = re.sub(r"<[^>]+>", " ", html_fragment)
-    text = unescape(text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _extract_message_text_from_row(row_html):
-    cells = re.findall(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", row_html, flags=re.IGNORECASE | re.DOTALL)
-    cleaned_cells = []
-    for cell in cells:
-        cleaned = _clean_html_text(cell)
-        if cleaned:
-            cleaned_cells.append(cleaned)
-
-    code_cells = [cell for cell in cleaned_cells if extract_code(cell)]
-    if code_cells:
-        # غالباً خلية الرسالة تحتوي نص أطول من باقي الأعمدة (رقم/تاريخ)
-        return max(code_cells, key=len)
-
-    return _clean_html_text(row_html)
-
-
-def _extract_messages_with_codes(html_text):
-    rows = re.findall(r"<tr\b[^>]*>(.*?)</tr>", html_text, flags=re.IGNORECASE | re.DOTALL)
-    messages = []
-
-    for row in rows:
-        message_text = _extract_message_text_from_row(row)
-        code = extract_code(message_text)
-        if code:
-            messages.append({"code": code, "message": message_text})
-
-    return messages
-
-
-def _extract_csrf_token(html_text):
-    token_match = re.search(r'name="_token"\s+value="([^"]+)"', html_text)
-    return token_match.group(1) if token_match else ""
+    requests.post(url, data=data)
 
 
 class IvaSMS:
+
     def __init__(self, email, password):
+
         self.email = email
         self.password = password
-        self.session = SimpleSession()
+
+        self.session = requests.Session()
+        self.session.headers.update(headers)
 
     def login(self):
-        login_url = BASE_URL + "/login"
-        login_page = self.session.get(login_url, timeout=20)
-        token = _extract_csrf_token(login_page.text)
 
-        payload = {"email": self.email, "password": self.password, "_token": token}
-        response = self.session.post(login_url, data=payload, timeout=20)
-        return "/portal" in response.url
+        login_url = BASE_URL + "/login"
+
+        r = self.session.get(login_url)
+
+        token = ""
+        token_match = re.search(r'name="_token" value="(.*?)"', r.text)
+
+        if token_match:
+            token = token_match.group(1)
+
+        payload = {
+            "email": self.email,
+            "password": self.password,
+            "_token": token
+        }
+
+        r = self.session.post(login_url, data=payload)
+
+        return "/portal" in r.url
 
     def get_sms(self):
+
         url = BASE_URL + "/portal/live/my_sms"
-        response = self.session.get(url, timeout=20)
-        return _extract_messages_with_codes(response.text)
+
+        r = self.session.get(url)
+
+        html = r.text
+
+        messages = re.findall(r"<tr.*?</tr>", html, re.S)
+
+        results = []
+
+        for row in messages:
+
+            text = re.sub("<.*?>", " ", row)
+            text = re.sub("\s+", " ", text)
+
+            code_match = re.search(r"\b\d{4,8}\b", text)
+
+            if code_match:
+
+                code = code_match.group()
+
+                results.append({
+                    "code": code,
+                    "message": text.strip()
+                })
+
+        return results
 
 
-def run_polling_loop(email=EMAIL, password=PASSWORD):
-    if not email or not password:
-        print("Missing IVASMS_EMAIL or IVASMS_PASSWORD")
-        return
+client = IvaSMS(EMAIL, PASSWORD)
 
-    client = IvaSMS(email, password)
-
-    try:
-        logged_in = client.login()
-    except Exception as error:  # noqa: BLE001
-        print("Login Error:", error)
-        return
-
-    if not logged_in:
-        print("Login Failed")
-        return
+if client.login():
 
     print("Login OK")
-    seen_fingerprints = set()
+
+    seen = set()
 
     while True:
+
         try:
-            messages = client.get_sms()
-            print("Total Messages:", len(messages))
 
-            for msg_data in messages:
-                fingerprint = f"{msg_data['code']}|{msg_data['message']}"
-                if fingerprint in seen_fingerprints:
-                    continue
+            sms_list = client.get_sms()
 
-                telegram_message = (
-                    "🔐 OTP RECEIVED\n\n"
-                    f"🔑 Code: {msg_data['code']}\n\n"
-                    f"📩 Full Message:\n{msg_data['message']}"
-                )
+            print("Total Messages:", len(sms_list))
 
-                print(telegram_message)
-                send_telegram(telegram_message)
-                seen_fingerprints.add(fingerprint)
+            for sms in sms_list:
 
-            time.sleep(POLL_INTERVAL_SECONDS)
+                fingerprint = sms["code"] + sms["message"]
 
-        except Exception as error:  # noqa: BLE001
-            print("Error:", error)
-            time.sleep(RETRY_DELAY_SECONDS)
+                if fingerprint not in seen:
 
+                    message = f"""
+🔐 OTP RECEIVED
 
-if __name__ == "__main__":
-    run_polling_loop()
+Code: {sms['code']}
+
+Message:
+{sms['message']}
+"""
+
+                    print(message)
+
+                    send_telegram(message)
+
+                    seen.add(fingerprint)
+
+            time.sleep(5)
+
+        except Exception as e:
+
+            print("Error:", e)
+
+            time.sleep(5)
+
+else:
+
+    print("Login Failed")
