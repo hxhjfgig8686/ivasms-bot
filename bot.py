@@ -138,7 +138,7 @@ Message:
 
             print("Error:", e)
 
-            time.sleep(5)
+            time.sleep(3)
 
 else:
 
